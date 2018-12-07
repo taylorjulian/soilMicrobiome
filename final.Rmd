@@ -1,0 +1,264 @@
+---
+title: "final"
+author: "taylor minich"
+date: "12/5/2018"
+output: html_document
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+require(leaflet)
+require(vegan)
+require(plyr)
+require(tidyverse)
+require(PBSmapping)
+require(lme4)
+require(reshape)
+```
+
+## Introduction
+### NEON
+#### National Ecological Observatory Network
+
+NEON is a continent-scale ecological observation facility that collects and provides open data from 81 field sites across the United States. NEON sites collect data on the atmosphere, populations and communities, ecohydrology, biogeochemistry, and land cover and processes. 
+
+[MAP]
+
+### MG-RAST
+#### Metagenomics analysis server
+One type of data collected by NEON is microbial genomic diversity of soil samples across various field sites. These samples are then uploaded to MG-RAST, the metagenomics analysis server, and analyzed using the server's pipeline. The server takes the raw reference sequences and estimates abundance, in terms of reference sequences, for both structural and functional diversity. 
+
+[IMAGES]
+
+Structural diversity details the distribution of abundances in the sample across different taxa, from the domain level to the species or OTU (operational taxonomic unit) level. Functional diversity describes the number of reads with predicted protein functions across various categories such as protein metabolism, respiration, and nitrogen-fixation. Whereas structural diversity tells *what* microbes are in a sample, functional diversity tells *how* those microbes are behaving. Both are critical in understanding soil microbial composition and function. 
+
+### Research questions
+
+* Does structural diversity correlate with functional diversity?
+   + Do communities with higher structural diversity also have higher functional diversity, or can a community      maintain function with lower levels of taxonomic diversity?
+* Along with environmental covariates, can structural diversity predict functional diversity?
+   + Which environmental processes, if any, are important in determining functional diversity?
+   
+## Data
+### NEON sites
+
+NEON has collected soil microbial data for 142 samples across 10 sites. Some samples were collected at the same latitude-longitude point, and therefore overlap.
+
+```{r NEON sites, fig.width = 9.5, fig.cap = 'Map showing the samples (red) collected within each NEON site (blue).'}
+samples <- read.csv('samples.csv')
+sites <- read.csv('sites.csv')
+m <- leaflet() %>% setView(lng = -90, lat = 38, zoom = 4) %>% addTiles() %>% 
+  addCircleMarkers(data = samples, ~lon, ~lat, popup = ~as.character(id), label = ~as.character(id), radius = 6, color = 'red', fillOpacity = 0.5) %>%
+  addMarkers(data = sites, ~lon, ~lat, popup = ~as.character(name), label = ~as.character(name))
+m
+```
+
+```{r site codes}
+knitr::kable(sites[,1:2], caption = 'Table of the ten NEON sites in the study along with their associated code.')
+```
+
+### MG-RAST API
+
+The MG-RAST RESTful API provides access to all data and data objects created by the MG-RAST pipeline as JSON objects, including sequence data, quality control results, and annotations. The MG-RAST server codes each sample as a string starting with 'mgm' followed by seven numbers, a period, and one last number (*e.g.* 'mgm4637809.3'). The NEON samples are of two main types, 'mgm4637...' and 'mgm4664...'. The last three numbers (before the period) are specific to the sample. Using this syntax, I developed vectors of strings denoting all the samples for each site. 
+
+```{r site vectors, echo = TRUE, eval = TRUE}
+# vectors of samples
+s1 <- c() # of the first type
+for(i in 809:868){
+  s1[i] <- paste0('mgm4637', i, '.3')
+  
+}
+
+s2 <- c() # of the second type
+for(i in 850:931){
+  s2[i] <- paste0('mgm4664', i, '.3')
+}
+
+# vectors of samples by site
+bartSamples <- c(s1[809])
+cperSamples <- c(s1[810:833], s2[858], s2[866], s2[889], s2[890:891], s2[901])
+dsnySamples <- c(s1[834:849], s2[865], s2[870], s2[897], s2[910], s2[912], s2[915], 
+               s2[918], s2[922], s2[925:926])
+jercSamples <- c(s1[850:852])
+osbsSamples <- c(s1[853:856], s2[850], s2[852], s2[856:857], s2[861], s2[864], s2[877], 
+               s2[882], s2[884], s2[886:887], s2[900], s2[908], s2[913:914], s2[920])
+sterSamples <- c(s1[857:868], s2[878], s2[880], s2[898], s2[899], s2[921], s2[924], s2[927], s2[931])
+scbiSamples <- c(s2[851], s2[867], s2[896], s2[907])
+harvSamples <- c(s2[853:854], s2[862:863], s2[868:869], s2[873], s2[876], s2[881], s2[888], s2[892:893], 
+               s2[902:903], s2[909], s2[911], s2[916], s2[919], s2[928])
+woodSamples <- c(s2[855], s2[859], s2[871:872], s2[875], s2[883], s2[885], s2[904], s2[917])
+tallSamples <- c(s2[860], s2[874], s2[879], s2[894:895], s2[905:906], s2[923], s2[929], s2[930])
+```
+
+I then created two functions - one for structural diversity and one for functional diversity - that access the MG-RAST API and return abundances. I looped through all the samples for each site with these functions. 
+
+```{r API functions, echo = TRUE, eval = FALSE}
+# function for iterating through different sites structural data
+structure <- function(site){
+  url <- 'http://api.metagenomics.anl.gov'
+  path <- paste0('matrix/organism?group_level=species&source=RefSeq&id=', site)
+  response <- GET(url = url, path = path)
+  content <- rawToChar(response$content)
+  submit <- fromJSON(content)
+  response <- GET(submit$url)
+  biom <- rawToChar(response$content)
+  x <- fromJSON(biom)
+  df <- data.frame(x$data$rows$metadata$hierarchy, x$data$data)
+  colnames(df)[colnames(df) == 'x.data.data'] <- c('abundance')
+  df
+}
+
+# function for iterating through different sites functional data
+func <- function(site){
+  url <- 'http://api.metagenomics.anl.gov'
+  path <- paste0('matrix/function?id=', site, '&source=Subsystems&group_level=level1&identity=80')
+  response <- GET(url = url, path = path)
+  content <- rawToChar(response$content)
+  submit <- fromJSON(content)
+  response <- GET(submit$url)
+  biom <- rawToChar(response$content)
+  x <- fromJSON(biom)
+  df <- data.frame(x$data$rows$id, x$data$data)
+  colnames(df) <- c('func', 'abundance')
+  df
+}
+
+# example loop for central plains experimental range
+  # cper
+cper <- list()
+
+for(i in cperSamples){
+  name <- paste0(i)
+  cper[[i]] <- assign(name, structure(i))
+}
+
+# collect all sites into a single list, one for structure and one for function
+structure <- list(bart, cper, dsny, harv, jerc, osbs, scbi, ster, tall, wood)
+names(structure) <- c('bart', 'cper', 'dsny', 'harv', 'jerc', 'osbs', 'scbi', 'ster', 'tall', 'wood')
+save(structure, file = 'structure.Rdata')
+
+func <- list(bart, cper, dsny, harv, jerc, osbs, scbi, ster, tall, wood)
+names(func) <- c('bart', 'cper', 'dsny', 'harv', 'jerc', 'osbs', 'scbi', 'ster', 'tall', 'wood')
+save(func, file = 'func.Rdata')
+```
+
+Although accessing data through the MG-RAST API requires much less time than through the website directly, it is still impractical to reproduce this step within the document here. Therefore, I have sent the .Rdata files along with the markdown for the analysis. All other steps are reproducible with the attached code. 
+
+```{r abundance tables, eval = TRUE, echo = FALSE}
+load('func.Rdata')
+load('structure.Rdata')
+t1 <- head(structure$cper$mgm4637825.3[,c('domain', 'phylum', 'class', 'order', 'family', 'genus', 'species', 'abundance')])
+t2 <- head(func$cper$mgm4637825.3)
+knitr::kable(t1, caption = 'Example of format for structural abundance tables (first six rows of sample mgm4637825.3).')
+knitr::kable(t2, col.names = c('function', 'abundance'), caption = ' Example of format for functional abundance tables (first six rows of sample mgm4637825.3).')
+```
+
+### Google Earth Engine
+
+
+## Analysis
+
+### Diversity metrics
+
+In order to quantify the structural and functional diversity of each sample, I used two common metrics: alpha and beta diversity. Alpha ($\alpha$) diversity refers to the variety of species observed at a single point whereas beta ($\beta$) diversity refers the variation in alpha diversity within a region. Both measures were calculated using the *vegan* package, which contains tools for descriptive community ecology. 
+
+Before these metrics can be calculated, the abundances must be in the form of a community matrix, which is sample *x* species (or sample *x* function). I developed two functions, one for structure and one for function, to convert the abundance tables to comunity matrices. 
+
+```{r community functions, echo = TRUE, eval = TRUE}
+
+communityS <- function(x){ # turns abundance tables into community matrices for structure
+  list <- mapply(`[<-`, x, 'sample', value = names(x), SIMPLIFY = FALSE)
+  bind <- dplyr::bind_rows(list)
+  df <- as.data.frame(cast(bind, sample ~ species, value = 'abundance', fun.aggregate = mean))
+  df[is.na(df)] <- 0
+  df
+}
+
+communityF <- function(x){ # turns abundance tables into community matrices for function
+  list <- mapply(`[<-`, x, 'sample', value = names(x), SIMPLIFY = FALSE)
+  bind <- dplyr::bind_rows(list)
+  df <- as.data.frame(cast(bind, sample ~ func, value = 'abundance', fun.aggregate = mean))
+  df[is.na(df)] <- 0
+  df
+}
+```
+
+#### Alpha diversity
+
+The most common index for alpha diversity is the Shannon index:
+
+$$H' = - \sum_{i=1}^Rp_i\ln(p_i)$$
+
+where $p_i$ is the proportion of individuals belonging to the *i*th species. I calculated the alpha diversity for each sample in terms of structure and function, and compiled these values into a table with the following workflow:
+
+```{r alpha metrics, echo = TRUE, eval = TRUE}
+# alpha diversity
+alpha <- function(s, f){
+  cs <- communityS(s)
+  cf <- communityF(f)
+  df <- as.data.frame(cbind(cs[,1], diversity(cs[,-1], index = 'shannon'), diversity(cf[,-1], index = 'shannon')))
+  colnames(df) <- c('sample', 'structure', 'func')
+  df$structure <- as.numeric(as.character(df$structure))
+  df$func <- as.numeric(as.character(df$func))
+  df
+}
+
+bart <- alpha(structure$bart, func$bart)
+cper <- alpha(structure$cper, func$cper)
+dsny <- alpha(structure$dsny, func$dsny)
+harv <- alpha(structure$harv, func$harv)
+jerc <- alpha(structure$jerc, func$jerc)
+osbs <- alpha(structure$osbs, func$osbs)
+scbi <- alpha(structure$scbi, func$scbi)
+ster <- alpha(structure$ster, func$ster)
+tall <- alpha(structure$tall, func$tall)
+wood <- alpha(structure$wood, func$wood)
+alpha <- list(bart, cper, dsny, harv, jerc, osbs, scbi, ster, tall, wood)
+names(alpha) <- c('bart', 'cper', 'dsny', 'harv', 'jerc', 'osbs', 'scbi', 'ster', 'tall', 'wood')
+alpha <- ldply(alpha)
+names(alpha) <- c('site', 'sample', 'structure', 'func')
+```
+
+#### Beta diversity
+
+Estimating beta diversity is complicated by the multiple dimensions in which it is operating. One common approach is to measure the dissimilarity between two samples, or the complement of the number of species shared in common between two samples. The Bray-Curtis index is perhaps the most popular dissimilarity index:
+
+$$BC_{ij}=1-\frac{2C_{ij}}{S_i+S_j}$$
+where $C_{ij}$ is the sum of the lesser values for only those species in common between both sites, and S is the total number of species at a site. The workflow for calculating beta diversity is similar to that of alpha diversity. 
+
+```{r beta metrics, eval = TRUE, echo = TRUE}
+# beta diversity
+beta <- function(s, f, sites){ # function for calculating bray-curtis dissimilarity that places each value in a dataframe
+  cs <- communityS(s)
+  cf <- communityF(f)
+  bs <- as.matrix(vegdist(cs[,-1], 'bray'))
+  bf <- as.matrix(vegdist(cf[,-1], 'bray'))
+  rownames(bs) <- sites
+  colnames(bs) <- sites
+  rownames(bf) <- sites
+  colnames(bf) <- sites
+  dfF <- data.frame(sample1=rownames(bf)[row(bf)], sample2=colnames(bf)[col(bf)],
+                        beta.function=c(bf))
+  dfS <- data.frame(sample1=rownames(bs)[row(bs)], sample2=colnames(bs)[col(bs)],
+                        beta.structure=c(bs))
+  df <- merge(dfF, dfS, by = c('sample1', 'sample2'))
+  df
+}
+
+bart <- beta(structure$bart, func$bart, bartSamples)
+cper <- beta(structure$cper, func$cper, cperSamples)
+dsny <- beta(structure$dsny, func$dsny, dsnySamples)
+harv <- beta(structure$harv, func$harv, harvSamples)
+jerc <- beta(structure$jerc, func$jerc, jercSamples)
+osbs <- beta(structure$osbs, func$osbs, osbsSamples)
+scbi <- beta(structure$scbi, func$scbi, scbiSamples)
+ster <- beta(structure$ster, func$ster, sterSamples)
+tall <- beta(structure$tall, func$tall, tallSamples)
+wood <- beta(structure$wood, func$wood, woodSamples)
+beta <- list(bart, cper, dsny, harv, jerc, osbs, scbi, ster, tall, wood)
+names(beta) <- c('bart', 'cper', 'dsny', 'harv', 'jerc', 'osbs', 'scbi', 'ster', 'tall', 'wood')
+beta <- ldply(beta)
+names(beta) <- c('site', 'sample1', 'sample2', 'func', 'structure') # dataframe of dissimilarity for all pairwise samples for all sites
+```
+
